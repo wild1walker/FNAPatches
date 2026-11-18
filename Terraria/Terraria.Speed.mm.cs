@@ -28,7 +28,9 @@ using Terraria.Graphics.Shaders;
 //     TR_WATER=0: off);
 //   - the fixed lists' "inactive" remembered (TrPatches.Scan, TR_SCAN=0: off, TR_SCAN_AUDIT=1: checked), loops passing the
 //     slots known inactive, the dust list's inactive end, the search for a free dust, the lying items' merge (TR_SAME=0: off).
-// TERRARIA_SPEED=0 leaves all of it out; TERRARIA_SPLIT=0, TERRARIA_INITS=0, TERRARIA_SCANS=0, TERRARIA_DRAWCUTS=0 one pass.
+//   - the interface's draw: work whose answer is already known (TrPatches.Ui: the minimap's boss bags and icons, the
+//     projectile type searches, the players seen, the lock-on marks; TR_UI=0: off; TR_SCAN_AUDIT=1 checks its marks).
+// TERRARIA_SPEED=0 leaves all of it out; TERRARIA_UI=0 the interface's cuts; TERRARIA_SPLIT=0, TERRARIA_INITS=0, TERRARIA_SCANS=0, TERRARIA_DRAWCUTS=0 one pass.
 namespace MonoMod
 {
 	public static class MonoModRules
@@ -40,6 +42,13 @@ namespace MonoMod
 				return;
 			}
 			bool hook = false;
+			// the interface's cuts: their sums taken of the game's code as shipped (here, before MonoMod weaves anything; the
+			// weave rewrites the bodies' encoding), applied before the scans (the loops are matched as the game wrote them)
+			if (Environment.GetEnvironmentVariable("TERRARIA_UI") != "0")
+			{
+				TerrariaPatches.TileConvert.UiPass.Look(MonoModRule.Modder.Module);
+				hook |= TerrariaPatches.TileConvert.Passes.Add(TerrariaPatches.TileConvert.Passes.Ui, "ui", m => TerrariaPatches.TileConvert.UiPass.Apply(m));
+			}
 			if (Environment.GetEnvironmentVariable("TERRARIA_DRAWCUTS") != "0")
 				hook |= TerrariaPatches.TileConvert.Passes.Add(TerrariaPatches.TileConvert.Passes.DrawCuts, "drawcuts", m => TerrariaPatches.TileConvert.Speed.DrawCuts(m));
 			if (Environment.GetEnvironmentVariable("TERRARIA_SCANS") != "0")
@@ -67,6 +76,310 @@ namespace Terraria
 // interface cuts (Ui) are not taken, so their marks are left out here (FNAPatches).
 namespace TrPatches
 {
+    using System.Linq;
+    using Terraria.ID;
+
+    // ---- the interface (wild1walker, portmaster-terraria runtime/Ui.cs, MIT): TileConverter/UiCuts.cs
+
+    // Work of the interface's draw whose answer is known without it (trpatch, UiCuts):
+    //
+    // The minimap's boss bag layer asks every one of the 400 world items, every frame, whether it is a
+    // boss bag lying in the world: two reads from memory a slot (the world item, its inner item), about
+    // 0.13 ms of a frame on the RK3326 with the fights' dropped coins. A world item found active and not
+    // a bag is marked at its index ("plain"), as Scan marks an inactive one: the mark holds while the slot
+    // keeps the object, the object its inner item, and the inner item its type. Every write of an item's
+    // type goes through Scan.Type, a new inner item through Scan.Inner and a new index through Scan.Who,
+    // and each takes the mark away (Scan); the bag table is the game's constant set. NextBag hands the
+    // layer's loop the next slot that is not marked air or plain, so the loop's rounds for the others,
+    // which would only read and go on, are not made.
+    //
+    // The golf club's power bar and the Digtoise map layer look through all 1000 projectiles every frame
+    // for one of their types (722; 1098 and 1123). Every write of a projectile's type goes through
+    // ProjType, which notes the type as made; while none of a loop's types was ever made, no projectile
+    // can have one, and the loop is not begun.
+    //
+    // The minimap's creature icons ask every one of the 200 NPCs, every frame, whether it is a town NPC
+    // and whether it has a boss head icon (NPC.GetBossHeadTextureIndex): the 87 parts of the Destroyer,
+    // pirates, every creature. An NPC that is not a town NPC and whose type has no head icon whatever its
+    // state (the table's -1, and none of the types the routine treats apart) is marked at its index the
+    // same way; every write of an NPC's type or town flag goes through NpcType and NpcTown, a new index
+    // through Scan.Who, and each takes the mark away. NextIcon hands the three map icon loops the next
+    // NPC that is not marked so or inactive.
+    //
+    // TR_UI=0: none of it. TR_SCAN_AUDIT=1 checks the plain marks with Scan's.
+    public static class Ui
+    {
+        static readonly bool on = Environment.GetEnvironmentVariable("TR_UI") != "0";
+        public static long Bags, Passed, Skipped, Icons, IconsPassed;
+
+        // ---- boss bags on the minimap: the plain marks (cleared by Scan)
+        internal static readonly object[] seenB = new object[401];
+        internal static readonly byte[] plainB = new byte[401];
+
+        // from slot i of Main.item, the first slot below n whose round could do anything (a null slot, an
+        // item that could be a bag, or one the game's own code should fail on), or -1 with none left
+        public static int NextBag(int i, int n)
+        {
+            var list = Main.item;
+            if (!on || Scan.Stop || i < 0 || i >= n || n > list.Length || n > plainB.Length)
+                return i;
+            bool[] bag = ItemID.Sets.BossBag;
+            Bags++;
+            for (int j = i; j < n; j++)
+            {
+                var o = list[j];
+                if (o == null)
+                    return Found(i, j);
+                if (plainB[j] != 0 && seenB[j] == o || Scan.Air(o, j))
+                    continue;
+                var it = o.inner;
+                if (it == null)
+                    return Found(i, j);
+                int type = it.type;
+                if (type == 0)
+                {
+                    Scan.LookItem(o, j);
+                    continue;
+                }
+                if ((uint)type >= (uint)bag.Length || bag[type])
+                    return Found(i, j);
+                Plain(o, it, j);
+            }
+            Passed += n - i;
+            return -1;
+        }
+
+        static int Found(int i, int j)
+        {
+            Passed += j - i;
+            return j;
+        }
+
+        // o, at index k, holds it, whose type is neither 0 nor a bag: marked, unless something moved
+        static void Plain(WorldItem o, Item it, int k)
+        {
+            if (o.whoAmI != k)
+                return;
+            int type = it.type;
+            plainB[k] = 0;
+            seenB[k] = o;
+            ((Terraria.patch_Item)(object)it).trSlot = k + 1;     // (FNAPatches) the field patch_Item adds
+            plainB[k] = 1;
+            Thread.MemoryBarrier();
+            if (it.type != type || o.inner != it || o.whoAmI != k)
+                plainB[k] = 0;
+        }
+
+        // ---- the map's creature icons: the plain marks (cleared here and by Scan.Who)
+        internal static readonly object[] seenM = new object[201];
+        internal static readonly byte[] plainM = new byte[201];
+        // the types NPC.GetBossHeadTextureIndex works out from more than the table (1.4.5.8's, checked by
+        // the patcher on the routine's code)
+        static readonly bool[] apart = Apart(4, 125, 126, 262, 266, 439, 440);
+
+        static bool[] Apart(params int[] types)
+        {
+            var a = new bool[types.Max() + 1];
+            foreach (int t in types) a[t] = true;
+            return a;
+        }
+
+        // from slot i of Main.npc, the first slot below n whose round could draw (a town NPC, a type with a
+        // head icon, a null slot), or -1 with none left
+        public static int NextIcon(int i, int n)
+        {
+            var list = Main.npc;
+            if (!on || Scan.Stop || i < 0 || i >= n || n > list.Length || n > plainM.Length)
+                return i;
+            int[] heads = NPCID.Sets.BossHeadTextures;
+            Icons++;
+            for (int j = i; j < n; j++)
+            {
+                var o = list[j];
+                if (o == null)
+                {
+                    IconsPassed += j - i;
+                    return j;
+                }
+                if (plainM[j] != 0 && seenM[j] == o || !Scan.Active(o, j))
+                    continue;
+                int type = o.type;
+                if (o.townNPC || (uint)type >= (uint)heads.Length || heads[type] != -1 || type < apart.Length && apart[type])
+                {
+                    IconsPassed += j - i;
+                    return j;
+                }
+                PlainNpc(o, type, j);
+            }
+            IconsPassed += n - i;
+            return -1;
+        }
+
+        static void PlainNpc(NPC o, int type, int k)
+        {
+            if (o.whoAmI != k)
+                return;
+            plainM[k] = 0;
+            seenM[k] = o;
+            plainM[k] = 1;
+            Thread.MemoryBarrier();
+            if (o.type != type || o.townNPC || o.whoAmI != k)
+                plainM[k] = 0;
+        }
+
+        // every "npc.type = value" and "npc.townNPC = value" of the game
+        public static void NpcType(NPC o, int value)
+        {
+            o.type = value;
+            Unmark(o);
+        }
+
+        public static void NpcTown(NPC o, bool value)
+        {
+            o.townNPC = value;
+            Unmark(o);
+        }
+
+        static void Unmark(NPC o)
+        {
+            Thread.MemoryBarrier();
+            int k = o.whoAmI;
+            if ((uint)k < (uint)plainM.Length && seenM[k] == o)
+                plainM[k] = 0;
+        }
+
+        // Scan.Audit: every plain mark against its object
+        internal static int Audit()
+        {
+            int wrong = 0;
+            int[] heads = NPCID.Sets.BossHeadTextures;
+            for (int k = 0; k < plainM.Length && k < Main.npc.Length; k++)
+                if (plainM[k] != 0 && Main.npc[k] == seenM[k])
+                {
+                    var o = (NPC)seenM[k];
+                    if (o.townNPC || (uint)o.type >= (uint)heads.Length || heads[o.type] != -1 || o.type < apart.Length && apart[o.type]
+                        || o.whoAmI != k || o.active && o.GetBossHeadTextureIndex() != -1)
+                        wrong++;
+                }
+            bool[] bag = ItemID.Sets.BossBag;
+            for (int k = 0; k < plainB.Length && k < Main.item.Length; k++)
+                if (plainB[k] != 0 && Main.item[k] == seenB[k])
+                {
+                    var o = (WorldItem)seenB[k];
+                    int type = o.inner.type;
+                    if (type == 0 || (uint)type >= (uint)bag.Length || bag[type] || o.whoAmI != k || ((Terraria.patch_Item)(object)o.inner).trSlot != k + 1)
+                        wrong++;
+                }
+            return wrong;
+        }
+
+        // ---- the map's players: from slot i of Main.player, the first slot below n that is the local
+        // player or not marked inactive by Scan (DrawPlayerMapIcon_CanBeSeen is false for the others, from
+        // their "active" alone), or -1 with none left
+        public static long Seen;
+
+        public static int NextSeen(int i, int n)
+        {
+            var list = Main.player;
+            if (!on || Scan.Stop || i < 0 || i >= n || n > list.Length)
+                return i;
+            int me = Main.myPlayer;
+            for (int j = i; j < n; j++)
+            {
+                var o = list[j];
+                if (j != me && o != null && Scan.IdlePlayer(o, j))
+                    continue;
+                Seen += j - i;
+                return j;
+            }
+            Seen += n - i;
+            return -1;
+        }
+
+        // ---- LockOnHelper.Draw's loop (1.4.5.8, summed by the patcher): for each NPC i, mark = 2 when
+        // _pickedTarget != -1 && _targets.Count > 0 && i == _targets[_pickedTarget]; else 1 when (flag &&
+        // _targets.Contains(i)) || (UseMode == 2 && _threeDSTarget == i) || (UseMode == 1 &&
+        // _targetClosestTarget == i); else 0. Then p[i,0] = Clamp(p[i,0] + (mark == 1 ? 0.1 : -0.1), 0, 1),
+        // p[i,1] likewise for mark 2, and a draw only where one of them is above 0. With no mark anywhere
+        // and every value +0 (bits), each round stores +0 over +0 and draws nothing.
+        public static long LockOn;
+
+        public static unsafe bool LockOnIdle(float[,] progress, int picked, System.Collections.Generic.List<int> targets, int mode, int threeDS, int closest, bool flag)
+        {
+            if (!on || progress == null || targets == null || flag || progress.Length == 0 || progress.GetLength(1) < 2)
+                return false;
+            int n = progress.GetLength(0);
+            if (picked != -1 && targets.Count > 0 || mode == 2 && (uint)threeDS < (uint)n || mode == 1 && (uint)closest < (uint)n)
+                return false;
+            fixed (float* p = &progress[0, 0])
+            {
+                int* bits = (int*)p;
+                for (int k = 0, length = progress.Length; k < length; k++)
+                    if (bits[k] != 0)
+                        return false;
+            }
+            LockOn++;
+            return true;
+        }
+
+        // PingMapLayer.Draw's count of pings: none, and the cut is on (the layer returns at once)
+        public static bool NoPings(int count) => on && count == 0;
+
+        // StateSnapshot.Restore (the game's testing code) puts objects back past every hook: the marks go,
+        // and every projectile type counts as made from then on
+        public static void Restored()
+        {
+            Array.Clear(plainB, 0, plainB.Length);
+            Array.Clear(plainM, 0, plainM.Length);
+            odd = true;
+        }
+
+        // ---- projectile types ever made
+        static readonly byte[] made = new byte[1 << 12];
+        static volatile bool odd;           // a type outside the table: every type counts as made
+
+        // every "projectile.type = value" of the game: noted when the projectile is one of Main.projectile's
+        // (the list is filled with new projectiles of type 0 and never takes another object: the patcher
+        // checks), not for the game's samples of every type
+        public static void ProjType(Projectile p, int value)
+        {
+            p.type = value;
+            var list = Main.projectile;
+            int k = p.whoAmI;
+            if (list != null && ((uint)k < (uint)list.Length && list[k] == p || Array.IndexOf(list, p) >= 0))
+            {
+                if ((uint)value < (uint)made.Length)
+                    made[value] = 1;
+                else
+                    odd = true;
+            }
+        }
+
+        // was a projectile of this type ever made? (true when the cut is off). TR_SCAN_AUDIT=1: a "no"
+        // is checked against every projectile
+        static readonly bool audit = Environment.GetEnvironmentVariable("TR_SCAN_AUDIT") == "1";
+        public static long Wrong;
+
+        public static bool Made(int type)
+        {
+            if (!on || odd || (uint)type >= (uint)made.Length || made[type] != 0)
+                return true;
+            Skipped++;
+            if (audit)
+                foreach (var p in Main.projectile)
+                    if (p != null && p.type == type)
+                        Wrong++;
+            return false;
+        }
+
+        public static string Line()
+        {
+            string s = $"ui bags {Bags} passing {Passed}, icons {Icons} passing {IconsPassed}, players passing {Seen}, lock-on {LockOn} idle, searches {Skipped} not begun{(audit ? $" wrong {Wrong}" : "")}";   // (FNAPatches) portmaster-terraria adds its FNA prep's counts here
+            Bags = Passed = Skipped = Icons = IconsPassed = Seen = LockOn = 0;
+            return s;
+        }
+    }
+
 
     // The game keeps its projectiles, NPCs, players and dust in fixed lists (1000, 200, 255 and 6000
     // slots) and asks every slot "active?" in dozens of loops a frame. An object is hundreds of bytes
