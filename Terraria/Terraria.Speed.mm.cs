@@ -1081,12 +1081,13 @@ namespace TrPatches
     // that light by a strength; what it adds the light to is the texture times the colour, the stock
     // sprite shader's picture, which reads the texture once. On the H700's chip (240 MHz) the five reads
     // cost 5 to 7.5 ms of a 16.8 ms refresh: with them a sunset is 19 to 21 ms a frame, 30 frames a
-    // second; without, 13 ms. So the clouds are drawn with FNA's sprite shader: the same vertices, the
-    // same matrix (read back from the game's shader), the same blend. The lit edges are lost at sunrise,
-    // at sunset and at night (a cut of the picture); by day the strength is 0 and nothing is.
-    // NextHorizonRenderer.CloudsEnd asks here (DrawCuts.Clouds).
-    // TR_CLOUDS=1: the sprite shader only while the strength is 0 (the same picture: on this chip one
-    // cloud pixel in a hundred differs by 1 of 255, the two programs round differently);
+    // second; without, 13 ms. While the strength is 0 (by day) the light adds nothing, so then the clouds
+    // are drawn with FNA's sprite shader: the same vertices, the same matrix (read back from the game's
+    // shader), the same blend, the same picture (compared pixel by pixel on the H700, TR_CLOUDS_TEST:
+    // 516 frames, none differs). With a strength (sunrise, sunset, night) the game's shader draws them,
+    // as before. NextHorizonRenderer.CloudsEnd asks here (DrawCuts.Clouds).
+    // TR_CLOUDS=2: the sprite shader always: the lit edges are lost at sunrise, at sunset and at night
+    // (a cut of the picture, channels off by up to 83 of 255; portmaster-terraria's own default);
     // TR_CLOUDS=0: the game's shader always.
     //
     // Runs. CloudsEnd then draws its clouds one draw call each (100 to 200 a frame by day, about 2 us of
@@ -1105,8 +1106,8 @@ namespace TrPatches
     // one by one and in runs into two targets, and the pixels compared.
     public static class Clouds
     {
-        static readonly string mode = Environment.GetEnvironmentVariable("TR_CLOUDS") ?? "2";
-        static readonly bool on = mode != "0", always = mode != "1";
+        static readonly string mode = Environment.GetEnvironmentVariable("TR_CLOUDS") ?? "1";
+        static readonly bool on = mode != "0", always = mode == "2";
         // TR_CLOUDS_TEST=<frames>: every so many frames the clouds are drawn both ways into two targets
         // and the pixels compared (tests: the frame on the screen may be lost)
         static readonly int test = int.TryParse(Environment.GetEnvironmentVariable("TR_CLOUDS_TEST"), out int t) ? t : 0;
@@ -1120,6 +1121,12 @@ namespace TrPatches
         static Effect plain, gameShader;
         static EffectParameter matrix, gameMatrix;
         static bool flat, applied, zero;
+        // whether this pass has asked the buffer to draw (see End); the audit's counts
+        static bool drew;
+        static readonly int audit = int.TryParse(Environment.GetEnvironmentVariable("TR_CLOUDS_AUDIT"), out int a) ? a : 0;
+        static readonly FieldInfo sprites = typeof(SpriteDrawBuffer).GetField("vertexCount", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        static int asked, had;
+        public static int Passes, Unseen0, Stale;      // the passes, those with no cloud in view, those that began with sprites left (tests)
         // the run being gathered: its first and last cloud in view and their texture; the shader's matrix
         static int runFirst = -1, runEnd;
         static Texture runTexture;
@@ -1136,6 +1143,8 @@ namespace TrPatches
             zero = data.Z == 0f;
             flat = (zero || always || Always) && on && !Off;
             applied = false;
+            drew = false;
+            asked = 0;
             runFirst = -1;
             clipPlain = false;
             drawn.Clear();
@@ -1146,6 +1155,9 @@ namespace TrPatches
         public static void Apply(MiscShaderData s, DrawData? cloud)
         {
             if (test > 0 && cloud.HasValue) { shader = s; drawn.Add(cloud.Value); }
+            if (audit > 0 && asked == 0 && sprites != null)
+                had = (int)sprites.GetValue(Main.spriteBuffer) / 4;
+            asked++;
             if (!flat)
             {
                 Full++;
@@ -1193,6 +1205,7 @@ namespace TrPatches
             if (!flat || !runs || NoRuns)
             {
                 buffer.DrawSingle(i);
+                drew = true;
                 return;
             }
             Run(buffer, i);
@@ -1222,6 +1235,7 @@ namespace TrPatches
             if (runFirst < 0)
                 return;
             buffer.DrawRange(runFirst, runEnd - runFirst);
+            drew = true;
             Calls++;
             runFirst = -1;
             runTexture = null;
@@ -1250,9 +1264,30 @@ namespace TrPatches
         }
 
         // after the last cloud, in place of the buffer's Unbind
+        //
+        // The buffer forgets its sprites only as it draws: DrawRange starts by setting its count to 0, and
+        // the game's every cloud is a DrawSingle. Its next user (the next of the frame's three cloud
+        // passes, the trees, the player) adds its sprites after whatever is left and draws from the first.
+        // A pass whose clouds are all out of view draws no run, so it asks for an empty range: nothing is
+        // drawn, the sprites are forgotten as the game forgets them. (Without it the next user drew this
+        // pass's unseen clouds in place of its own first sprites: clouds, or parts of the player, missing
+        // for a frame whenever a pass had nothing in view.)
+        // TR_CLOUDS_AUDIT=1 (tests): the passes, those with no cloud in view and those that began with
+        // more sprites in the buffer than their clouds, written every 1800 passes; 2: with the buffer
+        // left as it was, to see the fault counted.
         public static void End(SpriteDrawBuffer buffer)
         {
             Flush(buffer);
+            if (audit > 0)
+            {
+                Passes++;
+                if (!drew) Unseen0++;
+                if (had > asked) Stale++;
+                if (Passes % 1800 == 0)
+                    Console.Error.WriteLine($"[clouds] audit: {Passes} passes, {Unseen0} with no cloud in view, {Stale} began with sprites left in the buffer");
+            }
+            if (!drew && audit != 2)
+                buffer.DrawRange(0, 0);
             if (test > 0 && drawn.Count > 0 && ++tests % test == 0)
                 try { Compare(buffer); }
                 catch (Exception e) { Console.Error.WriteLine("[clouds] test: " + e.Message); }
