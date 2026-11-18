@@ -23,7 +23,8 @@ mkdir -p "$T/monomod/ref" "$T/patches" "$T/libs" "$T/dlls" "$T/runtime" "$T/tool
 # the .NET runtime, for handhelds whose PortMaster does not carry it
 cp "$RT" "$T/runtime/dotnet-10.0.15-aarch64.squashfs"
 # our patches and the helper their rules run
-cp "$FP"/out/Terraria/{Terraria,ReLogic}.{TerrariaPatches,TileRecords,NetAccess,Lazy,Fonts,Pack,Speed}.mm.dll "$T/patches/" 2>/dev/null || true
+# (every patch assembly the build made: a new Terraria/*.mm.cs needs no line here)
+cp "$FP"/out/Terraria/*.mm.dll "$T/patches/"
 rm -f "$T"/patches/ReLogic.TileRecords.mm.dll
 cp "$FP"/deps/MonoMod/{MonoMod.Common,MonoMod.Utils}.dll "$FP/deps/MonoMod/MonoMod.exe" "$FP/out/Terraria/TileConverter.dll" \
    "$FP/out/Terraria/weave.exe" "$T/monomod/"
