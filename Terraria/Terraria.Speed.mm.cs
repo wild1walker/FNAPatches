@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Threading;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
@@ -9,6 +11,8 @@ using Mono.Cecil;
 using MonoMod;
 using MonoMod.InlineRT;
 using Terraria;
+using Terraria.DataStructures;
+using Terraria.Graphics.Shaders;
 
 #pragma warning disable 1591, 0649, 0169, 0414
 
@@ -17,7 +21,11 @@ using Terraria;
 //   - the longest routines split into parts and their locals no longer cleared at every call (the creatures' and
 //     projectiles' AI cleared up to 85 KB of stack per call: on the H700 the Destroyer went from about 49 to 60 fps);
 //   - draw cuts: one TileDrawInfo instead of one per tile, the zoom asked once a pass, only the queued sprites uploaded, the
-//     pylon layer's search left out with no pylon, the stars drawn texture by texture (TrPatches.Stars, TR_STARS=0: off);
+//     pylon layer's search left out with no pylon, the stars drawn texture by texture (TrPatches.Stars, TR_STARS=0: off),
+//     the clouds under the stock sprite shader where the cloud shader's edge light adds nothing, and in runs
+//     (TrPatches.Clouds, TR_CLOUD_RUNS=0: one call a cloud), the dust out of sight left out of the batch (TrPatches.Offscreen,
+//     TR_OFFSCREEN=0: off), the water's first question per tile from a copy of the screen's liquid (TrPatches.Water,
+//     TR_WATER=0: off);
 //   - the fixed lists' "inactive" remembered (TrPatches.Scan, TR_SCAN=0: off, TR_SCAN_AUDIT=1: checked), loops passing the
 //     slots known inactive, the dust list's inactive end, the search for a free dust, the lying items' merge (TR_SAME=0: off).
 // TERRARIA_SPEED=0 leaves all of it out; TERRARIA_SPLIT=0, TERRARIA_INITS=0, TERRARIA_SCANS=0, TERRARIA_DRAWCUTS=0 one pass.
@@ -750,5 +758,535 @@ namespace TrPatches
             kinds.Clear();
             holding = more;
         }
+    }
+
+    // ---- the clouds, the dust out of sight and the water (wild1walker, portmaster-terraria runtime/Clouds.cs, Offscreen.cs,
+    // Water.cs, MIT): TileConverter/DrawCuts.cs's Clouds, Dust and Water
+
+    // The background's clouds are drawn one by one under the game's cloud shader. It reads the cloud's
+    // texture five times for every pixel to light the edges that face the sun or the moon, and multiplies
+    // that light by a strength; what it adds the light to is the texture times the colour, the stock
+    // sprite shader's picture, which reads the texture once. On the H700's chip (240 MHz) the five reads
+    // cost 5 to 7.5 ms of a 16.8 ms refresh: with them a sunset is 19 to 21 ms a frame, 30 frames a
+    // second; without, 13 ms. So the clouds are drawn with FNA's sprite shader: the same vertices, the
+    // same matrix (read back from the game's shader), the same blend. The lit edges are lost at sunrise,
+    // at sunset and at night (a cut of the picture); by day the strength is 0 and nothing is.
+    // NextHorizonRenderer.CloudsEnd asks here (DrawCuts.Clouds).
+    // TR_CLOUDS=1: the sprite shader only while the strength is 0 (the same picture: on this chip one
+    // cloud pixel in a hundred differs by 1 of 255, the two programs round differently);
+    // TR_CLOUDS=0: the game's shader always.
+    //
+    // Runs. CloudsEnd then draws its clouds one draw call each (100 to 200 a frame by day, about 2 us of
+    // the game thread each on the RK3326 with the GL thread), though under the sprite shader nothing
+    // changes between two clouds but the texture: the shader, its matrix and the states are set before
+    // the first. So with the sprite shader the clouds are drawn in runs (Single, in place of the
+    // buffer's DrawSingle): one call for clouds that follow one another in the list with the same
+    // texture, the same vertices in the same order (the chip blends the triangles of one call in their
+    // order, as it does those of calls one after another). A cloud whose quad lies wholly beyond one
+    // edge of the view (its four vertices through the shader's matrix, 5 % of the view's half width
+    // past it: the shader's half-pixel shift and the chip's rounding cannot bring it back) puts nothing
+    // on the screen whatever texture is bound: it does not end a run and is drawn with the run around
+    // it, and a run neither starts nor ends with one. Under the game's shader every cloud has its own
+    // values: drawn one by one, as the game does. TR_CLOUD_RUNS=0: one by one always.
+    // TR_CLOUDS_TEST=<frames> with TR_CLOUDS_TEST_RUNS=1: every so many frames the clouds are drawn
+    // one by one and in runs into two targets, and the pixels compared.
+    public static class Clouds
+    {
+        static readonly string mode = Environment.GetEnvironmentVariable("TR_CLOUDS") ?? "2";
+        static readonly bool on = mode != "0", always = mode != "1";
+        // TR_CLOUDS_TEST=<frames>: every so many frames the clouds are drawn both ways into two targets
+        // and the pixels compared (tests: the frame on the screen may be lost)
+        static readonly int test = int.TryParse(Environment.GetEnvironmentVariable("TR_CLOUDS_TEST"), out int t) ? t : 0;
+        static readonly bool testRuns = Environment.GetEnvironmentVariable("TR_CLOUDS_TEST_RUNS") == "1";
+        static readonly bool runs = Environment.GetEnvironmentVariable("TR_CLOUD_RUNS") != "0";
+        public static bool Off, Always; // tests (Parts.Sweep, "@clouds": the game's shader; "@plain": never)
+        public static bool NoRuns;      // tests (Parts.Sweep, "@runs")
+        public static int Plain, Full;
+        public static long Calls, Unseen;       // the runs' draw calls, and the clouds out of view (tests)
+
+        static Effect plain, gameShader;
+        static EffectParameter matrix, gameMatrix;
+        static bool flat, applied, zero;
+        // the run being gathered: its first and last cloud in view and their texture; the shader's matrix
+        static int runFirst = -1, runEnd;
+        static Texture runTexture;
+        static Matrix clip;
+        static bool clipPlain;
+        static MiscShaderData shader;
+        static readonly List<DrawData> drawn = new List<DrawData>();
+        static RenderTarget2D[] targets;
+        static int tests;
+
+        // the strength is the vector's z: set once, before the clouds are drawn
+        public static MiscShaderData Strength(MiscShaderData s, Vector4 data)
+        {
+            zero = data.Z == 0f;
+            flat = (zero || always || Always) && on && !Off;
+            applied = false;
+            runFirst = -1;
+            clipPlain = false;
+            drawn.Clear();
+            return s.UseShaderSpecificData(data);
+        }
+
+        // before every cloud, in place of the game's shader
+        public static void Apply(MiscShaderData s, DrawData? cloud)
+        {
+            if (test > 0 && cloud.HasValue) { shader = s; drawn.Add(cloud.Value); }
+            if (!flat)
+            {
+                Full++;
+                s.Apply(cloud);
+                return;
+            }
+            Plain++;
+            if (!applied)
+                Flat(s, cloud);
+            applied = true;
+        }
+
+        // The game's shader once, for the states and the matrix it sets, then the sprite shader with that
+        // matrix; nothing between two clouds changes either.
+        static void Flat(MiscShaderData s, DrawData? cloud)
+        {
+            s.Apply(cloud);
+            if (plain == null)
+            {
+                var device = Main.graphics.GraphicsDevice;
+                using (var code = typeof(Effect).Assembly.GetManifestResourceStream("Microsoft.Xna.Framework.Graphics.Effect.Resources.SpriteEffect.fxb"))
+                using (var bytes = new MemoryStream())
+                {
+                    code.CopyTo(bytes);
+                    plain = new Effect(device, bytes.ToArray());
+                }
+                matrix = plain.Parameters["MatrixTransform"];
+            }
+            // the game's shader's matrix (its parameter looked up by name once per shader)
+            if (s.Shader != gameShader)
+            {
+                gameShader = s.Shader;
+                gameMatrix = gameShader.Parameters["MatrixTransform"];
+            }
+            clip = gameMatrix.GetValueMatrix();
+            matrix.SetValue(clip);
+            plain.CurrentTechnique.Passes[0].Apply();
+            // a transform that keeps w at 1: the clip test below reads x and y as they are
+            clipPlain = clip.M14 == 0f && clip.M24 == 0f && clip.M34 == 0f && clip.M44 == 1f;
+        }
+
+        // in place of the buffer's DrawSingle, after Apply for the same cloud
+        public static void Single(SpriteDrawBuffer buffer, int i)
+        {
+            if (!flat || !runs || NoRuns)
+            {
+                buffer.DrawSingle(i);
+                return;
+            }
+            Run(buffer, i);
+        }
+
+        static void Run(SpriteDrawBuffer buffer, int i)
+        {
+            if (!InView(buffer, i))
+            {
+                Unseen++;
+                return;
+            }
+            Texture texture = buffer.textures[i];
+            if (runFirst >= 0 && texture == runTexture)
+            {
+                runEnd = i + 1;
+                return;
+            }
+            Flush(buffer);
+            runFirst = i;
+            runEnd = i + 1;
+            runTexture = texture;
+        }
+
+        static void Flush(SpriteDrawBuffer buffer)
+        {
+            if (runFirst < 0)
+                return;
+            buffer.DrawRange(runFirst, runEnd - runFirst);
+            Calls++;
+            runFirst = -1;
+            runTexture = null;
+        }
+
+        // whether a cloud's quad may reach the view: not when its four vertices, through the shader's
+        // matrix, lie beyond one edge of the clip square by 5 % of it
+        const float Edge = 1.05f;
+        static bool InView(SpriteDrawBuffer buffer, int i)
+        {
+            if (!clipPlain)
+                return true;
+            VertexPositionColorTexture[] v = buffer.vertices;
+            int left = 0, right = 0, low = 0, high = 0;
+            for (int k = i * 4; k < i * 4 + 4; k++)
+            {
+                Vector3 p = v[k].Position;
+                float x = p.X * clip.M11 + p.Y * clip.M21 + p.Z * clip.M31 + clip.M41;
+                float y = p.X * clip.M12 + p.Y * clip.M22 + p.Z * clip.M32 + clip.M42;
+                if (x < -Edge) left++;
+                else if (x > Edge) right++;
+                if (y < -Edge) low++;
+                else if (y > Edge) high++;
+            }
+            return left < 4 && right < 4 && low < 4 && high < 4;
+        }
+
+        // after the last cloud, in place of the buffer's Unbind
+        public static void End(SpriteDrawBuffer buffer)
+        {
+            Flush(buffer);
+            if (test > 0 && drawn.Count > 0 && ++tests % test == 0)
+                try { Compare(buffer); }
+                catch (Exception e) { Console.Error.WriteLine("[clouds] test: " + e.Message); }
+            buffer.Unbind();
+        }
+
+        static void Compare(SpriteDrawBuffer buffer)
+        {
+            var device = Main.graphics.GraphicsDevice;
+            var view = device.Viewport;
+            var before = device.GetRenderTargets();
+            if (targets == null || targets[0].Width != view.Width || targets[0].Height != view.Height)
+            {
+                targets = new RenderTarget2D[2];
+                for (int k = 0; k < 2; k++)
+                    targets[k] = new RenderTarget2D(device, view.Width, view.Height, false, SurfaceFormat.Color, DepthFormat.None, 0, RenderTargetUsage.PreserveContents);
+            }
+            var pixels = new Color[2][];
+            for (int k = 0; k < 2; k++)
+            {
+                device.SetRenderTarget(targets[k]);
+                device.Clear(Color.Transparent);
+                for (int i = 0; i < drawn.Count; i++)
+                {
+                    if (testRuns)
+                    {
+                        // the sprite shader both times: one by one, then in runs
+                        if (i == 0) Flat(shader, drawn[0]);
+                        if (k == 0) buffer.DrawSingle(i);
+                        else Run(buffer, i);
+                        continue;
+                    }
+                    if (k == 0) shader.Apply(drawn[i]);
+                    else if (i == 0) Flat(shader, drawn[0]);
+                    buffer.DrawSingle(i);
+                }
+                Flush(buffer);
+                pixels[k] = new Color[view.Width * view.Height];
+            }
+            device.SetRenderTargets(before);
+            device.Viewport = view;
+            for (int k = 0; k < 2; k++)
+                targets[k].GetData(pixels[k]);
+            int differ = 0, most = 0, shown = 0;
+            for (int i = 0; i < pixels[0].Length; i++)
+            {
+                Color a = pixels[0][i], b = pixels[1][i];
+                if (a.PackedValue != 0) shown++;
+                if (a.PackedValue == b.PackedValue) continue;
+                differ++;
+                most = Math.Max(most, Math.Max(Math.Max(Math.Abs(a.R - b.R), Math.Abs(a.G - b.G)), Math.Max(Math.Abs(a.B - b.B), Math.Abs(a.A - b.A))));
+            }
+            Console.Error.WriteLine($"[clouds] test: {drawn.Count} clouds, strength {(zero ? "0" : "not 0")}, {view.Width}x{view.Height}: "
+                + $"{shown} pixels drawn, {differ} differ between " + (testRuns ? "one by one and runs" : "the game's shader and the sprite shader") + $" (most by {most})");
+        }
+    }
+
+    // Main.DrawDust hands the sprite batch every dust within a rectangle 1000 pixels wider than the
+    // screen on either side and 1050 taller above and below (what lies beyond it the game switches
+    // off). On a 640 x 480 screen nearly all of that rectangle is out of sight. A sprite there costs
+    // the batch its vertices (a sine and a cosine of the game's, sixteen products) and the chip its
+    // four vertices, and the chip then clips it whole: no pixel is touched.
+    //
+    // Here DrawDust's own Begin, End and Draw of the batch come through (trpatch, DrawCuts.Dust), so
+    // the batch's mode, effect and transform are known as DrawDust set them. While the batch is
+    // deferred, with no effect of its own and a transform that only scales and moves, a sprite that
+    // lies wholly beyond one edge of the view is not handed to the batch. Everything else of the
+    // game's loop runs as before, in its order: the light and the colour of every dust are worked out
+    // and a dust found black is switched off as the game does; only the batch's draws of sprites that
+    // cannot reach the screen are left out.
+    //
+    // Beyond an edge: the sprite's quad lies within a circle around its position, of radius the scale
+    // times the farthest corner of the source rectangle from the origin, at any rotation (the sum of
+    // the two offsets bounds that distance). FNA's batch places the quad in the target's pixels as
+    // position * transform, the view being [0, width] x [0, height] of the viewport (the batch's
+    // projection, made from the viewport as the batch ends); the chip draws nothing outside it. With
+    // the circle 4 pixels beyond an edge, the rounding of the batch's and the chip's arithmetic (well
+    // under a pixel at these sizes) and the shader's half-pixel shift cannot bring a corner back.
+    //
+    // The light of a dust's tile (Lighting.GetColor, six places in DrawDust) is asked here as well: the
+    // dust of a bullet's trail or of a hit lie on one tile, one after another in the list, and nothing
+    // changes the lighting while the dust is drawn (the frame's lighting runs after the draw; with
+    // TR_LIGHT_AHEAD on its own thread meanwhile: then every call goes to the game). The tile asked
+    // just before gets the answer it got; the memory is dropped at every Begin and End.
+    // TR_OFFSCREEN=0: every sprite drawn, every light asked. TR_OFFSCREEN_AUDIT=1 (tests): every sprite
+    // drawn, and each one that would have been left out is placed corner by corner, as the batch places
+    // it, and counted wrong unless all four corners lie beyond the same edge; a light given again is
+    // asked of the game too and compared.
+    public static class Offscreen
+    {
+        static readonly bool on = Environment.GetEnvironmentVariable("TR_OFFSCREEN") != "0";
+        static readonly bool audit = Environment.GetEnvironmentVariable("TR_OFFSCREEN_AUDIT") == "1";
+        public static bool Off;         // tests (Parts.Sweep, "@offscreen")
+        public static long Drawn, Left; // sprites handed to the batch, and left out (tests)
+        public static long Lit, Asked;  // lights given again, and asked of the game (tests)
+        public static long Wrong;       // the audit's: corners found within the view, viewports changed
+
+        const float Margin = 4f;
+        static bool plain;
+        static float m11, m22, m41, m42, width, height;
+        static int viewWidth, viewHeight;
+
+        // in place of DrawDust's SpriteBatch.Begin
+        public static void Begin(SpriteBatch batch, SpriteSortMode sort, BlendState blend, SamplerState sampler,
+            DepthStencilState depth, RasterizerState raster, Effect effect, Matrix transform)
+        {
+            batch.Begin(sort, blend, sampler, depth, raster, effect, transform);
+            Viewport view = batch.GraphicsDevice.Viewport;
+            viewWidth = view.Width;
+            viewHeight = view.Height;
+            plain = on && !Off && sort == SpriteSortMode.Deferred && effect == null && viewWidth > 0 && viewHeight > 0
+                && transform.M12 == 0f && transform.M13 == 0f && transform.M14 == 0f
+                && transform.M21 == 0f && transform.M23 == 0f && transform.M24 == 0f
+                && transform.M31 == 0f && transform.M32 == 0f && transform.M34 == 0f && transform.M44 == 1f
+                && Finite(transform.M11) && Finite(transform.M22) && Finite(transform.M41) && Finite(transform.M42);
+            m11 = transform.M11;
+            m22 = transform.M22;
+            m41 = transform.M41;
+            m42 = transform.M42;
+            width = viewWidth;
+            height = viewHeight;
+            lightX = int.MinValue;
+        }
+
+        // in place of DrawDust's SpriteBatch.End: the batch makes its projection from the viewport now
+        public static void End(SpriteBatch batch)
+        {
+            if (plain)
+            {
+                Viewport view = batch.GraphicsDevice.Viewport;
+                if (view.Width != viewWidth || view.Height != viewHeight)
+                {
+                    Wrong++;
+                    Console.Error.WriteLine($"[offscreen] the viewport changed within the dust's batch: {viewWidth}x{viewHeight} -> {view.Width}x{view.Height}");
+                }
+            }
+            plain = false;
+            lightX = int.MinValue;
+            batch.End();
+        }
+
+        static int lightX = int.MinValue, lightY;
+        static Color light;
+
+        // in place of DrawDust's Lighting.GetColor(int, int)
+        public static Color Light(int x, int y)
+        {
+            // (FNAPatches) portmaster-terraria also asks the game here while its lighting runs on a core of its own
+            // (LightAhead.Holding); that thread is not in this port
+            if (!on || Off)
+                return Terraria.Lighting.GetColor(x, y);
+            if (x == lightX && y == lightY)
+            {
+                Lit++;
+                if (audit && Terraria.Lighting.GetColor(x, y).PackedValue != light.PackedValue)
+                {
+                    Wrong++;
+                    if (Wrong <= 20)
+                        Console.Error.WriteLine($"[offscreen] the light of tile {x},{y} changed while the dust was drawn");
+                }
+                return light;
+            }
+            Asked++;
+            light = Terraria.Lighting.GetColor(x, y);
+            lightX = x;
+            lightY = y;
+            return light;
+        }
+
+        // in place of DrawDust's SpriteBatch.Draw
+        public static void Draw(SpriteBatch batch, Texture2D texture, Vector2 position, Rectangle? source, Color color,
+            float rotation, Vector2 origin, float scale, SpriteEffects effects, float depth)
+        {
+            if (plain && Outside(texture, position, source, origin, scale))
+            {
+                Left++;
+                if (!audit)
+                    return;
+                Check(texture, position, source, origin, rotation, scale);
+            }
+            else
+                Drawn++;
+            batch.Draw(texture, position, source, color, rotation, origin, scale, effects, depth);
+        }
+
+        static bool Finite(float x) => x > -1e7f && x < 1e7f;
+
+        static bool Outside(Texture2D texture, Vector2 position, Rectangle? source, Vector2 origin, float scale)
+        {
+            float w, h;
+            if (source.HasValue)
+            {
+                w = source.Value.Width;
+                h = source.Value.Height;
+            }
+            else
+            {
+                w = texture.Width;
+                h = texture.Height;
+            }
+            float reach = (Math.Max(Math.Abs(origin.X), Math.Abs(w - origin.X)) + Math.Max(Math.Abs(origin.Y), Math.Abs(h - origin.Y))) * Math.Abs(scale);
+            float x = position.X * m11 + m41, y = position.Y * m22 + m42;
+            float rx = reach * Math.Abs(m11) + Margin, ry = reach * Math.Abs(m22) + Margin;
+            if (!(Finite(x) && Finite(y) && Finite(rx) && Finite(ry)))
+                return false;
+            return x + rx < 0f || x - rx > width || y + ry < 0f || y - ry > height;
+        }
+
+        // the audit: the four corners as FNA's batch places them (offsets from the origin, scaled,
+        // turned by the rotation, moved to the position, then the transform), in double precision
+        static void Check(Texture2D texture, Vector2 position, Rectangle? source, Vector2 origin, float rotation, float scale)
+        {
+            double w = source.HasValue ? source.Value.Width : texture.Width;
+            double h = source.HasValue ? source.Value.Height : texture.Height;
+            double s = Math.Sin(rotation), c = Math.Cos(rotation);
+            int left = 0, right = 0, above = 0, below = 0;
+            for (int k = 0; k < 4; k++)
+            {
+                double dx = ((k & 1) * w - origin.X) * scale, dy = ((k >> 1) * h - origin.Y) * scale;
+                double x = (position.X + dx * c - dy * s) * m11 + m41;
+                double y = (position.Y + dx * s + dy * c) * m22 + m42;
+                if (x < -1) left++;
+                if (x > width + 1) right++;
+                if (y < -1) above++;
+                if (y > height + 1) below++;
+            }
+            if (left == 4 || right == 4 || above == 4 || below == 4)
+                return;
+            Wrong++;
+            if (Wrong <= 20)
+                Console.Error.WriteLine($"[offscreen] a sprite left out reaches the view: at {position}, scale {scale}, rotation {rotation}, origin {origin}, {w}x{h}, view {width}x{height}");
+        }
+
+        public static string Line() => $"offscreen {Left} of {Left + Drawn}, lights {Lit} again {Asked} asked" + (audit ? $" wrong {Wrong}" : "");
+    }
+
+    // Main.oldDrawWater asks every tile of the screen and a margin, row by row, whether it holds
+    // liquid; most hold none. The tiles are kept column after column (Tiles), so each question of a
+    // row is a tile's height of the world away from the one before: on the RK3326 a cache miss each,
+    // about 0.3 ms of a frame. Now, as the routine starts, the liquid of the tiles its loops walk is
+    // copied column by column, in the order of memory, and the loop's first question (trpatch,
+    // DrawCuts.Water) is answered from the copy. Nothing writes a tile's liquid while the routine
+    // draws (it puts a fresh tile only where the grid holds none, which the copy is not made for);
+    // a tile outside the copy is asked as before. TR_WATER=0: asked as before. TR_WATER_AUDIT=1
+    // (tests): each answer from the copy is compared with the tile's.
+    //
+    // The copy's place and size are in Copy, a class with no static constructor (as Tiles): the
+    // compiled loop reads them with no check that the class is ready. The counts are made per copy.
+    public static unsafe class Water
+    {
+        static readonly bool on = Environment.GetEnvironmentVariable("TR_WATER") != "0";
+        static readonly bool audit = Environment.GetEnvironmentVariable("TR_WATER_AUDIT") == "1";
+        public static bool Off;         // tests (Parts.Sweep, "@water")
+        public static long Copies, Copied, Asked, Wrong;
+        static int room;
+
+        public static class Copy
+        {
+            public static byte* data;
+            public static int x0, y0, w, h;     // w 0: no copy (or every answer asked, TR_WATER_AUDIT)
+        }
+
+        // Main.oldDrawWater, as it starts: the loops' bounds as the routine works them out
+        public static void Begin()
+        {
+            Copy.w = 0;
+            if (!on || Off || Tiles.fastW == 0)
+                return;
+            float range = Main.drawToScreen ? 0f : Main.offScreenRange;
+            Vector2 at = Main.screenPosition;
+            int left = (int)((at.X - range) / 16f - 1f);
+            int right = (int)((at.X + Main.screenWidth + range) / 16f) + 2;
+            int top = (int)((at.Y - range) / 16f - 1f);
+            int bottom = (int)((at.Y + Main.screenHeight + range) / 16f) + 5;
+            if (left < 5) left = 5;
+            if (right > Main.maxTilesX - 5) right = Main.maxTilesX - 5;
+            if (top < 5) top = 5;
+            if (bottom > Main.maxTilesY - 5) bottom = Main.maxTilesY - 5;
+            int ax = left - 2, bx = right + 2, ay = top, by = bottom + 4;
+            if (ax < 0) ax = 0;
+            if (ay < 0) ay = 0;
+            if (bx > Tiles.fastW) bx = Tiles.fastW;
+            if (by > Tiles.fastH) by = Tiles.fastH;
+            if (bx <= ax || by <= ay)
+                return;
+            int cw = bx - ax, ch = by - ay;
+            if (room < cw * ch)
+            {
+                if (Copy.data != null)
+                    Marshal.FreeHGlobal((IntPtr)Copy.data);
+                Copy.data = null;
+                room = 0;
+                try
+                {
+                    Copy.data = (byte*)Marshal.AllocHGlobal(cw * ch * 5 / 4);
+                    room = cw * ch * 5 / 4;
+                }
+                catch (OutOfMemoryException)
+                {
+                    return;     // no copy: every tile asked as before
+                }
+            }
+            int height = Tiles.fastH;
+            byte* c = Copy.data;
+            for (int x = 0; x < cw; x++)
+            {
+                // (FNAPatches) the column's records (TileRecords: 14 bytes, the liquid at 4)
+                byte* t = Tiles.data + (long)((ax + x) * height + ay) * Tiles.RecordSize + 4;
+                byte* d = c + x;
+                for (int y = 0; y < ch; y++, d += cw, t += Tiles.RecordSize)
+                    *d = *t;
+            }
+            Copy.x0 = ax; Copy.y0 = ay; Copy.h = ch;
+            Copies++;
+            Copied += cw * ch;
+            if (audit)
+            {
+                // every answer through Asked, compared there
+                auditW = cw;
+                return;
+            }
+            Copy.w = cw;
+        }
+
+        static int auditW;
+
+        // in place of the loop's first Main.tile[x, y].liquid
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static int Liquid(int x, int y)
+        {
+            int dx = x - Copy.x0, dy = y - Copy.y0, w = Copy.w;
+            if ((uint)dx < (uint)w && (uint)dy < (uint)Copy.h)
+                return Copy.data[dy * w + dx];
+            return Ask(x, y);
+        }
+
+        static int Ask(int x, int y)
+        {
+            byte* r = (byte*)Tiles.At(x, y);     // (FNAPatches) the record's liquid, at 4
+            int v = r == null ? 0 : r[4];
+            int dx = x - Copy.x0, dy = y - Copy.y0;
+            if (audit && auditW > 0 && (uint)dx < (uint)auditW && (uint)dy < (uint)Copy.h && Copy.data[dy * auditW + dx] != v)
+                Wrong++;
+            Asked++;
+            return v;
+        }
+
+        public static string Line() => $"water {Copies} copies of {Copied} tiles, {Asked} asked" + (audit ? $" wrong {Wrong}" : "");
     }
 }
