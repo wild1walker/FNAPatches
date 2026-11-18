@@ -24,6 +24,11 @@ namespace TerrariaPatches.TileConvert
 					throw new InvalidOperationException("Frames." + helper.Name + ": " + holes.Count + " placeholders, 1 expected");
 				holes[0].OpCode = OpCodes.Ldarg;
 				holes[0].Operand = helper.Parameters.Single(p => p.Name == "tile");
+				// and the call names the routine as it is now (its tile a pointer): the reference the runtime was compiled with
+				// still has the tile as an object, which no routine has any more
+				var call = helper.Body.Instructions.Single(i => i.OpCode == OpCodes.Call || i.OpCode == OpCodes.Callvirt);
+				var named = (MethodReference)call.Operand;
+				call.Operand = m.GetType(named.DeclaringType.FullName).Methods.Single(x => x.Name == named.Name && x.Parameters.Count == named.Parameters.Count);
 				n++;
 			}
 			if (n != 2)
