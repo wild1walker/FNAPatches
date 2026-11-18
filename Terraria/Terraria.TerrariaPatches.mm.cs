@@ -75,34 +75,17 @@ namespace Terraria.Utilities
 	[MonoModPatch("global::Terraria.Utilities.MessageBox")]
 	static class patch_MessageBox
 	{
+		// The game's message boxes go to the log and answer with their default button. A handheld has no window manager to show a
+		// box and often no way to press its buttons, and FNA's SDL2 binding of SDL_ShowMessageBox faults under .NET 10 while it
+		// marshals the struct (Marshal.StructureToPtr of the null colorScheme: AccessViolationException), so an error the game
+		// wanted to show (Program.DisplayException) ended the process without a word of it in log.txt.
 		[MonoModReplace]
 		public static int Show(string message, string title, string[] buttonLabels, int returnButtonIndex = -1, int cancelButtonIndex = -1, MessageBoxIcon icon = MessageBoxIcon.None)
 		{
-			SDL.SDL_MessageBoxButtonData[] buttons = new SDL.SDL_MessageBoxButtonData[buttonLabels.Length];
-			for (int i = 0; i < buttons.Length; i++)
-			{
-				SDL.SDL_MessageBoxButtonFlags flags = 0;
-				if (i == returnButtonIndex) flags = SDL.SDL_MessageBoxButtonFlags.SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT;
-				else if (i == cancelButtonIndex) flags = SDL.SDL_MessageBoxButtonFlags.SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT;
-				buttons[i] = new SDL.SDL_MessageBoxButtonData { flags = flags, buttonid = i, text = buttonLabels[i] };
-			}
-			SDL.SDL_MessageBoxData data = new SDL.SDL_MessageBoxData
-			{
-				flags = (SDL.SDL_MessageBoxFlags)(uint)icon,
-				window = IntPtr.Zero,
-				title = title,
-				message = message,
-				numbuttons = buttons.Length,
-				buttons = buttons,
-				colorScheme = null
-			};
-			int id;
-			if (SDL.SDL_ShowMessageBox(ref data, out id) < 0)
-			{
-				Console.WriteLine(title + ": " + message);
-				return -1;
-			}
-			return id;
+			int answer = returnButtonIndex >= 0 && returnButtonIndex < buttonLabels.Length ? returnButtonIndex : 0;
+			Console.Error.WriteLine("[message box] " + title + ": " + message
+				+ (buttonLabels.Length > 1 ? " (answered: " + buttonLabels[answer] + ")" : ""));
+			return answer;
 		}
 	}
 }
