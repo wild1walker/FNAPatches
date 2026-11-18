@@ -11,8 +11,7 @@ static class DrawCuts
     public static int Apply(ModuleDefinition m, ModuleDefinition tr)
     {
         Open(m);
-        // (FNAPatches) the cuts that need no runtime of their own, and the stars; not the clouds, the dust or the water
-        return TileInfo(m) + EveryFrame(m) + SpriteUpload(m) + Stars(m, tr) + Pylons(m);
+        return TileInfo(m) + EveryFrame(m) + SpriteUpload(m) + Clouds(m, tr) + Stars(m, tr) + Pylons(m) + Dust(m, tr) + Water(m, tr);
     }
 
     // what TrPatches reads of the game's own (the reference it is compiled against has the same:
